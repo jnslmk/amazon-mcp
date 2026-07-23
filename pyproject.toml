@@ -1,0 +1,22 @@
+[project]
+name = "amazon-mcp"
+version = "0.1.0"
+description = "MCP server for amazon.de product search — self-hosted scraper, no API key"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=3.4.4",
+    "playwright>=1.45",
+    "beautifulsoup4>=4.12",
+]
+
+[project.scripts]
+amazon-mcp = "amazon_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["amazon_mcp"]
