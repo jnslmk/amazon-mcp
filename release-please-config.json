@@ -8,7 +8,8 @@
       "extra-files": [
         "amazon_mcp/server.py"
       ],
-      "last-release-sha": "f93ccb36e8d9bae52031b32cbab501999cbf3363"
+      "last-release-sha": "f93ccb36e8d9bae52031b32cbab501999cbf3363",
+      "include-component-in-tag": false
     }
   }
 }
