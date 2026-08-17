@@ -40,6 +40,81 @@ from amazon_mcp.amazon_client import (
 
 log = logging.getLogger("amazon-mcp")
 
+
+def _coerce_int(
+    value: str | int | None, field: str, *, ge: int | None = None
+) -> int | None:
+    """Coerce the numeric strings LLMs routinely send for int parameters.
+
+    FastMCP validates tool input against the JSON schema before the function
+    runs, so a parameter typed ``int`` rejects the string ``"5"`` outright —
+    and LibreChat's rejection names no field ("did not match expected
+    schema"), so the model cannot see what to fix and can only guess.
+    Accepting ``str | int`` in the schema and normalising here keeps the
+    model-facing contract lenient while the rest of the module still sees a
+    real int. Ported from aliexpress-mcp's ``_coerce_int``.
+    """
+    if value is None or isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+    else:
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    if ge is not None and result is not None and result < ge:
+        raise ValueError(f"{field} must be >= {ge}, got {result}")
+    return result
+
+
+def _coerce_float(
+    value: str | float | None, field: str, *, ge: float | None = None
+) -> float | None:
+    """Coerce numeric strings for float parameters (prices). See _coerce_int."""
+    if value is None or isinstance(value, (int, float)):
+        result = float(value) if value is not None else None
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = float(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} must be a number, got {value!r}") from exc
+    else:
+        raise ValueError(f"{field} must be a number, got {value!r}")
+    if ge is not None and result is not None and result < ge:
+        raise ValueError(f"{field} must be >= {ge}, got {result}")
+    return result
+
+
+def _resolve_limit(limit: str | int | None, max_results: str | int | None) -> int:
+    """Accept either name for the result-cap knob, on `search_amazon`.
+
+    Across the six sibling MCP servers behind LibreChat this knob has two
+    names — ``max_results`` in geizhals-mcp and baumarkt-mcp, ``limit`` in
+    aliexpress-mcp, ebay-mcp and amazon-mcp — and the model sees all of them
+    in one conversation, so it reaches for whichever name it used on a
+    sibling server a moment ago. ``limit`` stays canonical here; the alias is
+    declared in the schema rather than silently swallowed, because a quietly
+    ignored unknown key would hand back the default count while the model
+    believed it had asked for more. Modelled on kleinanzeigen-mcp's
+    ``_resolve_page_count``.
+    """
+    if limit is not None and max_results is not None:
+        resolved = _coerce_int(limit, "limit", ge=1)
+        alias = _coerce_int(max_results, "max_results", ge=1)
+        if resolved != alias:
+            raise ValueError(
+                "limit and max_results are two names for the same parameter "
+                f"but were given different values ({resolved} and {alias}); "
+                "pass limit only"
+            )
+    elif max_results is not None:
+        resolved = _coerce_int(max_results, "max_results", ge=1)
+    else:
+        resolved = _coerce_int(limit, "limit", ge=1)
+    return min(resolved or 10, 50)
+
+
 _browser: AmazonBrowser | None = None
 
 
@@ -64,7 +139,7 @@ async def lifespan(_: FastMCP) -> AsyncIterator[None]:
 
 mcp = FastMCP(
     name="amazon",
-    version="0.1.0",
+    version="0.1.1",
     lifespan=lifespan,
     instructions=(
         "Search amazon.de, Germany's Amazon marketplace, for products. Prices "
@@ -91,8 +166,8 @@ async def search_amazon(
         Field(description="Search keywords, e.g. 'usb c kabel' or 'anker powerbank'"),
     ],
     limit: Annotated[
-        int, Field(description="Maximum products to return", ge=1, le=50)
-    ] = 10,
+        str | int | None, Field(description="Maximum products to return")
+    ] = None,
     sort: Annotated[
         Optional[str],
         Field(
@@ -104,16 +179,20 @@ async def search_amazon(
         ),
     ] = None,
     min_price: Annotated[
-        Optional[float],
-        Field(description="Minimum price in EUR", ge=0),
+        str | float | None,
+        Field(description="Minimum price in EUR"),
     ] = None,
     max_price: Annotated[
-        Optional[float],
-        Field(description="Maximum price in EUR", ge=0),
+        str | float | None,
+        Field(description="Maximum price in EUR"),
     ] = None,
     page: Annotated[
-        int, Field(description="Result page number (~50 products per page)", ge=1)
+        str | int, Field(description="Result page number (~50 products per page)")
     ] = 1,
+    max_results: Annotated[
+        str | int | None,
+        Field(description="Deprecated alias for `limit`; prefer `limit`"),
+    ] = None,
 ) -> dict[str, Any]:
     """Search amazon.de for products by keyword, with optional price and sort.
 
@@ -121,6 +200,10 @@ async def search_amazon(
     Prime flag (when Amazon renders one), thumbnail image and canonical URL.
     Pass a product's `asin` to `get_amazon_product` for the full detail record.
     """
+    limit = _resolve_limit(limit, max_results)
+    page = _coerce_int(page, "page", ge=1) or 1
+    min_price = _coerce_float(min_price, "min_price", ge=0)
+    max_price = _coerce_float(max_price, "max_price", ge=0)
     url = build_search_url(
         query=query,
         sort=sort,
