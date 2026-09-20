@@ -172,8 +172,9 @@ class AmazonBrowser:
     async def fetch_html(self, url: str) -> str:
         """Load ``url`` in the shared long-lived context and return the HTML.
 
-        Navigation starts are paced across all callers; a bot challenge or a
-        429 stretches the spacing with bounded exponential backoff. Raises
+        Navigation starts are paced across all callers; a bot challenge, a 429
+        or a page mismatch stretches the spacing with bounded exponential
+        backoff. Raises
         :class:`BotChallengeError` / :class:`RateLimitError` /
         :class:`PageMismatchError` instead of returning an unusable page.
         """

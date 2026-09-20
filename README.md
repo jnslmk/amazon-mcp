@@ -47,7 +47,7 @@ No credentials. Everything is optional tuning (see `.env.example`):
 | `AMZ_MAX_CONCURRENT` | `2` | Max concurrent page loads |
 | `AMZ_NAV_TIMEOUT_MS` | `45000` | Per-navigation timeout |
 | `AMZ_PACING_MIN_S` / `AMZ_PACING_MAX_S` | `1.5` / `4.0` | Jittered delay between navigation starts |
-| `AMZ_BACKOFF_BASE_S` / `AMZ_BACKOFF_MAX_S` | `2.0` / `120.0` | Exponential backoff after blocks/429s (base / cap, seconds) |
+| `AMZ_BACKOFF_BASE_S` / `AMZ_BACKOFF_MAX_S` | `2.0` / `120.0` | Exponential backoff after blocks/429s/page mismatches (base / cap, seconds) |
 | `AMZ_RETRY_AFTER_MAX_S` | `180.0` | Ceiling for an honoured `Retry-After` value |
 
 Fetch failures never read as empty results: a bot challenge, an HTTP 429 or
