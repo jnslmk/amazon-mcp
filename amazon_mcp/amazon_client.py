@@ -47,6 +47,11 @@ PACING_MIN_S = float(os.getenv("AMZ_PACING_MIN_S", "1.5"))
 PACING_MAX_S = float(os.getenv("AMZ_PACING_MAX_S", "4.0"))
 BACKOFF_BASE_S = float(os.getenv("AMZ_BACKOFF_BASE_S", "2.0"))
 BACKOFF_MAX_S = float(os.getenv("AMZ_BACKOFF_MAX_S", "120.0"))
+# Ceiling for a server-supplied Retry-After, distinct from the exponential
+# backoff cap: a hostile or buggy Retry-After (hours/days) must not wedge the
+# pacer, but the honest-delay bound is kept looser than BACKOFF_MAX_S so a
+# genuine "come back in 90s" is still honoured in full.
+RETRY_AFTER_MAX_S = float(os.getenv("AMZ_RETRY_AFTER_MAX_S", "180.0"))
 
 # Let the real Chromium identity stand: the version in the UA then always
 # matches the engine actually running, instead of a pinned string that drifts
@@ -179,16 +184,31 @@ class AmazonBrowser:
         async with self._sem:
             await self._pace()
             page = await context.new_page()
+            failed = False
             try:
                 html = await self._load(page, url)
-            except (BotChallengeError, RateLimitError) as exc:
+            except (BotChallengeError, RateLimitError, PageMismatchError) as exc:
+                failed = True
                 self._back_off(getattr(exc, "retry_after", None))
+                raise
+            except BaseException:
+                # Any other in-flight error must reach the caller unchanged.
+                failed = True
                 raise
             else:
                 self._backoff_level = 0
                 return html
             finally:
-                await page.close()
+                try:
+                    await page.close()
+                except Exception as close_exc:  # noqa: BLE001
+                    # A failing close() must not mask the in-flight error, so
+                    # it only propagates when no other exception is underway.
+                    if not failed:
+                        raise
+                    log.warning(
+                        "page.close() failed after fetch error: %s", close_exc
+                    )
 
     async def _pace(self) -> None:
         """Space navigation starts across all callers (per-origin pacing).
@@ -211,15 +231,16 @@ class AmazonBrowser:
             )
 
     def _back_off(self, retry_after: Optional[float]) -> None:
-        """Stretch the pacer after a block or 429.
+        """Stretch the pacer after a block, 429 or page mismatch.
 
         Bounded exponential backoff over consecutive failures, never shorter
-        than a server-supplied Retry-After.
+        than a server-supplied Retry-After — which itself is capped at
+        RETRY_AFTER_MAX_S so a pathological value cannot wedge the pacer.
         """
         self._backoff_level += 1
         delay = min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2**self._backoff_level)
         if retry_after is not None:
-            delay = max(delay, retry_after)
+            delay = max(delay, min(retry_after, RETRY_AFTER_MAX_S))
         self._backoff_until = max(self._backoff_until, time.monotonic() + delay)
         log.warning(
             "amazon.de fetch failed; backing off %.0fs (level=%d, retry_after=%s)",

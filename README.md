@@ -43,9 +43,16 @@ No credentials. Everything is optional tuning (see `.env.example`):
 | `MCP_TRANSPORT` | `http` | `http` (streamable-HTTP) or `stdio` |
 | `MCP_HOST` / `MCP_PORT` / `MCP_PATH` | `0.0.0.0` / `8000` / `/mcp` | HTTP bind |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `AMZ_MAX_CONTEXTS` | `4` | Max concurrent Chromium contexts |
+| `AMZ_MAX_CONTEXTS` | `4` | Upper bound on the semaphore (one Chromium context is shared) |
 | `AMZ_MAX_CONCURRENT` | `2` | Max concurrent page loads |
 | `AMZ_NAV_TIMEOUT_MS` | `45000` | Per-navigation timeout |
+| `AMZ_PACING_MIN_S` / `AMZ_PACING_MAX_S` | `1.5` / `4.0` | Jittered delay between navigation starts |
+| `AMZ_BACKOFF_BASE_S` / `AMZ_BACKOFF_MAX_S` | `2.0` / `120.0` | Exponential backoff after blocks/429s (base / cap, seconds) |
+| `AMZ_RETRY_AFTER_MAX_S` | `180.0` | Ceiling for an honoured `Retry-After` value |
+
+Fetch failures never read as empty results: a bot challenge, an HTTP 429 or
+unrecognised markup raise a typed MCP tool error (`BotChallengeError`,
+`RateLimitError`, `PageMismatchError`) instead of returning zero products.
 
 ## Run
 
