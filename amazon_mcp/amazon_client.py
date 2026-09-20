@@ -17,31 +17,45 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
+import time
 from typing import Any, Optional
 from urllib.parse import quote_plus, urlencode
 
 from bs4 import BeautifulSoup
-from playwright.async_api import Browser, Page, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 log = logging.getLogger("amazon-mcp")
 
 BASE_URL = "https://www.amazon.de"
 
-# A single Chromium instance is the memory cost here; each request gets a fresh
-# context (a throwaway browser profile) and the whole thing is bounded by a
-# semaphore. A chat agent scrapes one request at a time, so the defaults are
-# deliberately lean and the deployment can raise them.
+# One long-lived Chromium context (a browser profile that keeps consent and
+# session cookies across fetches) is created at start; pages are created per
+# fetch and everything is bounded by a semaphore, with navigation starts
+# additionally spaced by the pacer below. A chat agent scrapes one request at
+# a time, so the defaults are deliberately lean and the deployment can raise
+# them.
 MAX_CONTEXTS = int(os.getenv("AMZ_MAX_CONTEXTS", "4"))
 MAX_CONCURRENT = int(os.getenv("AMZ_MAX_CONCURRENT", "2"))
 NAV_TIMEOUT_MS = int(os.getenv("AMZ_NAV_TIMEOUT_MS", "45000"))
 
-# A realistic desktop Chrome on Linux. amazon.de localises on Accept-Language.
-_USER_AGENT = os.getenv(
-    "AMZ_USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-)
+# Per-origin pacing: navigation starts are spaced by a jittered delay, and a
+# bot challenge or HTTP 429 stretches the spacing with bounded exponential
+# backoff (honouring Retry-After). Stdlib only: random + time on the loop.
+PACING_MIN_S = float(os.getenv("AMZ_PACING_MIN_S", "1.5"))
+PACING_MAX_S = float(os.getenv("AMZ_PACING_MAX_S", "4.0"))
+BACKOFF_BASE_S = float(os.getenv("AMZ_BACKOFF_BASE_S", "2.0"))
+BACKOFF_MAX_S = float(os.getenv("AMZ_BACKOFF_MAX_S", "120.0"))
+
+# Let the real Chromium identity stand: the version in the UA then always
+# matches the engine actually running, instead of a pinned string that drifts
+# stale (the old default claimed Chrome/125 long after Playwright moved on).
+# Chromium also sends its own current Accept header on navigations, so none is
+# pinned here. Operators can still override the UA via AMZ_USER_AGENT if
+# amazon.de tightens detection. Accept-Language stays pinned because amazon.de
+# localises on it.
+_USER_AGENT = os.getenv("AMZ_USER_AGENT") or None
 _EXTRA_HEADERS = {
     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 }
@@ -65,6 +79,27 @@ class BotChallengeError(RuntimeError):
     """
 
 
+class RateLimitError(RuntimeError):
+    """Raised when amazon.de answers a navigation with HTTP 429.
+
+    ``retry_after`` carries the server-supplied Retry-After in seconds when
+    the response exposes one, so the pacer can honour it; ``None`` otherwise.
+    """
+
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class PageMismatchError(RuntimeError):
+    """Raised when a fetched page matches no known amazon.de layout.
+
+    Neither a recognised block page nor a positively recognised results /
+    product / empty-results page — the markup drifted or a new challenge
+    shipped. Raised instead of silently parsing the page into zero results.
+    """
+
+
 class AmazonBrowser:
     """Owns one shared Chromium instance for the process lifetime."""
 
@@ -74,8 +109,16 @@ class AmazonBrowser:
         self._max_contexts = max_contexts
         self._playwright = None
         self._browser: Optional[Browser] = None
-        # Bound both concurrent navigations and live contexts with one gate.
+        self._context: Optional[BrowserContext] = None
+        # Bound concurrent navigations with one gate; the long-lived context
+        # keeps consent/session cookies across fetches.
         self._sem = asyncio.Semaphore(min(max_concurrent, max_contexts))
+        # Shared pacer state: the next permitted navigation start and the
+        # current backoff, keyed to this process's single scraped origin.
+        self._pace_lock = asyncio.Lock()
+        self._next_ok = 0.0
+        self._backoff_until = 0.0
+        self._backoff_level = 0
 
     async def start(self) -> None:
         self._playwright = await async_playwright().start()
@@ -92,6 +135,14 @@ class AmazonBrowser:
                 "--disable-gpu",
             ],
         )
+        context_kwargs: dict[str, Any] = {
+            "locale": "de-DE",
+            "extra_http_headers": _EXTRA_HEADERS,
+            "viewport": {"width": 1366, "height": 900},
+        }
+        if _USER_AGENT:
+            context_kwargs["user_agent"] = _USER_AGENT
+        self._context = await self._browser.new_context(**context_kwargs)
         log.info(
             "Chromium ready (max_contexts=%s, max_concurrent=%s)",
             self._max_contexts,
@@ -99,6 +150,9 @@ class AmazonBrowser:
         )
 
     async def close(self) -> None:
+        if self._context is not None:
+            await self._context.close()
+            self._context = None
         if self._browser is not None:
             await self._browser.close()
             self._browser = None
@@ -108,33 +162,85 @@ class AmazonBrowser:
 
     @property
     def ready(self) -> bool:
-        return self._browser is not None
+        return self._context is not None
 
     async def fetch_html(self, url: str) -> str:
-        """Load ``url`` in a fresh context and return the rendered HTML.
+        """Load ``url`` in the shared long-lived context and return the HTML.
 
-        Raises :class:`BotChallengeError` if amazon.de serves a robot/captcha
-        page instead of real content.
+        Navigation starts are paced across all callers; a bot challenge or a
+        429 stretches the spacing with bounded exponential backoff. Raises
+        :class:`BotChallengeError` / :class:`RateLimitError` /
+        :class:`PageMismatchError` instead of returning an unusable page.
         """
-        if self._browser is None:
+        context = self._context
+        if context is None:
             raise RuntimeError("Browser is not running")
 
         async with self._sem:
-            context = await self._browser.new_context(
-                locale="de-DE",
-                user_agent=_USER_AGENT,
-                extra_http_headers=_EXTRA_HEADERS,
-                viewport={"width": 1366, "height": 900},
-            )
+            await self._pace()
+            page = await context.new_page()
             try:
-                page = await context.new_page()
-                return await self._load(page, url)
+                html = await self._load(page, url)
+            except (BotChallengeError, RateLimitError) as exc:
+                self._back_off(getattr(exc, "retry_after", None))
+                raise
+            else:
+                self._backoff_level = 0
+                return html
             finally:
-                await context.close()
+                await page.close()
+
+    async def _pace(self) -> None:
+        """Space navigation starts across all callers (per-origin pacing).
+
+        The pacing lock is held while sleeping so concurrent callers queue
+        behind the claimed slot instead of all waking at once; the navigation
+        itself runs after the lock is released.
+        """
+        async with self._pace_lock:
+            delay = max(
+                self._next_ok - time.monotonic(),
+                self._backoff_until - time.monotonic(),
+                0.0,
+            )
+            if delay > 0:
+                log.debug("pacing: waiting %.1fs before next navigation", delay)
+                await asyncio.sleep(delay)
+            self._next_ok = time.monotonic() + random.uniform(
+                PACING_MIN_S, PACING_MAX_S
+            )
+
+    def _back_off(self, retry_after: Optional[float]) -> None:
+        """Stretch the pacer after a block or 429.
+
+        Bounded exponential backoff over consecutive failures, never shorter
+        than a server-supplied Retry-After.
+        """
+        self._backoff_level += 1
+        delay = min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2**self._backoff_level)
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        self._backoff_until = max(self._backoff_until, time.monotonic() + delay)
+        log.warning(
+            "amazon.de fetch failed; backing off %.0fs (level=%d, retry_after=%s)",
+            delay,
+            self._backoff_level,
+            retry_after,
+        )
 
     async def _load(self, page: Page, url: str) -> str:
         page.set_default_timeout(NAV_TIMEOUT_MS)
-        await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        response = await page.goto(
+            url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
+        )
+
+        if response is not None and response.status == 429:
+            # A rate-limited body is never content: surface it (with any
+            # Retry-After) so the pacer can back off before the next try.
+            raise RateLimitError(
+                "amazon.de rate-limited the request (HTTP 429)",
+                _parse_retry_after(response.headers),
+            )
 
         # Best-effort: dismiss the cookie-consent interstitial if it appears.
         for sel in ("#sp-cc-accept", 'input[name="accept"]'):
@@ -147,19 +253,46 @@ class AmazonBrowser:
                 pass
 
         is_search = "/s?" in url or "/s/" in url
+        selector = (
+            '[data-component-type="s-search-result"]'
+            if is_search
+            else "#productTitle, #dp"
+        )
         try:
-            if is_search:
-                await page.wait_for_selector(
-                    '[data-component-type="s-search-result"]', timeout=15000
-                )
-            else:
-                await page.wait_for_selector("#productTitle, #dp", timeout=15000)
-        except Exception:  # noqa: BLE001 - fall through to bot-check detection
+            await page.wait_for_selector(selector, timeout=15000)
+        except Exception:  # noqa: BLE001 - classified below, never swallowed
             pass
+        else:
+            # Positively recognised page: safe to hand to the parsers.
+            return await page.content()
 
+        # The selector never appeared. Classify what actually arrived instead
+        # of parsing it blindly — a silent zero-result parse hides both bot
+        # challenges and markup drift.
         html = await page.content()
         self._raise_if_blocked(html)
-        return html
+        if is_search and self._looks_like_empty_search(html):
+            return html
+        raise PageMismatchError(
+            f"amazon.de page at {url} never showed {selector!r} and matches no "
+            "known layout (results, product page, empty results or block "
+            "page) — the markup likely changed; refusing to parse it as zero "
+            "results"
+        )
+
+    @staticmethod
+    def _looks_like_empty_search(html: str) -> bool:
+        """Recognise amazon.de's legitimate zero-results page.
+
+        A search with no matches renders no result cards at all, so a missing
+        selector alone cannot tell "no products" from markup drift.
+        """
+        low = html.lower()
+        return (
+            "keine ergebnisse" in low
+            or "no results for" in low
+            or 'data-component-type="s-no-result"' in low
+        )
 
     @staticmethod
     def _raise_if_blocked(html: str) -> None:
@@ -185,6 +318,17 @@ class AmazonBrowser:
 # --------------------------------------------------------------------------- #
 # parsing helpers
 # --------------------------------------------------------------------------- #
+
+
+def _parse_retry_after(headers: Any) -> Optional[float]:
+    """Extract a Retry-After delay in seconds; None when absent or a date."""
+    raw = (headers or {}).get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None  # HTTP-date form — rare; exponential backoff covers it
 
 
 def _parse_price(text: Optional[str]) -> Optional[float]:

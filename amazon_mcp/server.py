@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any, Optional
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -31,12 +32,19 @@ from amazon_mcp.amazon_client import (
     BASE_URL,
     AmazonBrowser,
     BotChallengeError,
+    PageMismatchError,
+    RateLimitError,
     _canonical_product_url,
     _extract_asin,
     build_search_url,
     parse_product,
     parse_search_results,
 )
+
+# Fetch failures surfaced as typed MCP tool errors, never as an empty-but-
+# successful payload: a block, a rate limit or drifted markup must not be
+# readable by the model as "zero products found".
+_FETCH_ERRORS = (BotChallengeError, RateLimitError, PageMismatchError)
 
 log = logging.getLogger("amazon-mcp")
 
@@ -148,8 +156,9 @@ mcp = FastMCP(
         "the ASIN (or a full amazon.de URL) of anything worth a closer look to "
         "get the full description, feature bullets, availability and images. "
         "This is read-only product search — it cannot add to cart or buy. It "
-        "scrapes the live site, so an occasional empty result can just mean "
-        "Amazon's bot detection got in the way; retrying usually helps."
+        "scrapes the live site, so an occasional failed call (a bot-check, "
+        "rate-limit or page-mismatch error) can just mean Amazon's bot "
+        "detection got in the way; retrying usually helps."
     ),
 )
 
@@ -213,14 +222,8 @@ async def search_amazon(
     )
     try:
         html = await _require_browser().fetch_html(url)
-    except BotChallengeError as exc:
-        return {
-            "query": query,
-            "returned": 0,
-            "items": [],
-            "error": "bot_check",
-            "detail": str(exc),
-        }
+    except _FETCH_ERRORS as exc:
+        raise ToolError(str(exc)) from exc
 
     items = parse_search_results(html, limit=limit)
     return {
@@ -261,8 +264,8 @@ async def get_amazon_product(
     url = _canonical_product_url(asin, product) or f"{BASE_URL}/dp/{asin}"
     try:
         html = await _require_browser().fetch_html(url)
-    except BotChallengeError as exc:
-        return {"asin": asin, "url": url, "error": "bot_check", "detail": str(exc)}
+    except _FETCH_ERRORS as exc:
+        raise ToolError(str(exc)) from exc
 
     return parse_product(html, url)
 
