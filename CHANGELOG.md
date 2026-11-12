@@ -14,6 +14,13 @@
 
 Run the parser and real loopback HTTP-session regression with `python -m unittest discover -s tests`.
 
+## [0.2.0](https://github.com/jnslmk/amazon-mcp/compare/v0.1.2...v0.2.0) (2026-11-12)
+
+
+### Features
+
+* **http:** replace chromium with curl ([#3](https://github.com/jnslmk/amazon-mcp/issues/3)) ([2890bae](https://github.com/jnslmk/amazon-mcp/commit/2890bae2a1f9deb0b32466e12e868d201751596e))
+
 ## [0.1.2](https://github.com/jnslmk/amazon-mcp/compare/v0.1.1...v0.1.2) (2026-09-20)
 
 
