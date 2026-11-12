@@ -1,12 +1,10 @@
 """MCP server exposing amazon.de product search as tools for LLM agents.
 
 Amazon offers no keyless product-search API for this use case, so this is a
-scraper. Amazon fronts its pages with Akamai Bot Manager (a ``bm-verify`` JS
-challenge that plain HTTP clients cannot solve, even from residential IPs), so
-the scraping is done with a real headless Chromium via Playwright — the same
-shape as the sibling kleinanzeigen-mcp. The client library
-(:mod:`amazon_mcp.amazon_client`) owns Chromium's lifecycle; this module owns
-the two tools, response shaping and the streamable-HTTP transport.
+scraper. The client library (:mod:`amazon_mcp.amazon_client`) owns a shared
+curl_cffi async HTTP session with a Chrome TLS profile; this module owns the
+two tools, response shaping and the streamable-HTTP transport. No browser or
+JavaScript engine is needed; bot challenges are surfaced as tool errors.
 
 This is ToS-gray: it scrapes a site whose terms discourage automated access,
 and it is fragile by nature — Amazon can change its markup or tighten bot
@@ -30,7 +28,7 @@ from starlette.responses import JSONResponse
 
 from amazon_mcp.amazon_client import (
     BASE_URL,
-    AmazonBrowser,
+    AmazonHttpClient,
     BotChallengeError,
     PageMismatchError,
     RateLimitError,
@@ -123,26 +121,35 @@ def _resolve_limit(limit: str | int | None, max_results: str | int | None) -> in
     return min(resolved or 10, 50)
 
 
-_browser: AmazonBrowser | None = None
+_client: AmazonHttpClient | None = None
 
 
-def _require_browser() -> AmazonBrowser:
-    if _browser is None:  # pragma: no cover - guarded by the lifespan
-        raise RuntimeError("Browser is not running")
-    return _browser
+def _require_client() -> AmazonHttpClient:
+    if _client is None or not _client.ready:  # guarded by the lifespan
+        raise RuntimeError("HTTP client is not running")
+    return _client
 
 
 @asynccontextmanager
 async def lifespan(_: FastMCP) -> AsyncIterator[None]:
-    """Start one shared Chromium instance for the process lifetime."""
-    global _browser
-    _browser = AmazonBrowser()
-    await _browser.start()
+    """Own one HTTP session; shutdown errors never mask an in-flight error."""
+    global _client
+    client = AmazonHttpClient()
+    _client = client
     try:
-        yield
+        await client.start()
+        try:
+            yield
+        except BaseException:
+            try:
+                await client.close()
+            except Exception:
+                log.exception("HTTP session close failed after server error")
+            raise
+        else:
+            await client.close()
     finally:
-        await _browser.close()
-        _browser = None
+        _client = None
 
 
 mcp = FastMCP(
@@ -221,7 +228,7 @@ async def search_amazon(
         page=page,
     )
     try:
-        html = await _require_browser().fetch_html(url)
+        html = await _require_client().fetch_html(url)
     except _FETCH_ERRORS as exc:
         raise ToolError(str(exc)) from exc
 
@@ -263,11 +270,10 @@ async def get_amazon_product(
 
     url = _canonical_product_url(asin, product) or f"{BASE_URL}/dp/{asin}"
     try:
-        html = await _require_browser().fetch_html(url)
+        html = await _require_client().fetch_html(url)
+        return parse_product(html, url)
     except _FETCH_ERRORS as exc:
         raise ToolError(str(exc)) from exc
-
-    return parse_product(html, url)
 
 
 # --------------------------------------------------------------------------- #
@@ -277,8 +283,8 @@ async def get_amazon_product(
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(_: Request) -> JSONResponse:
-    """Container readiness probe: reports whether Chromium actually came up."""
-    if _browser is None or not _browser.ready:
+    """Local transport readiness, not a claim that Amazon will allow a fetch."""
+    if _client is None or not _client.ready:
         return JSONResponse({"status": "starting"}, status_code=503)
     return JSONResponse({"status": "ok"})
 

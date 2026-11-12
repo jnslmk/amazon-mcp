@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+* **scraper:** parse German and English price separators without inflating cents
+* **scraper:** require a product title and read only product-specific price slots, never recommendation prices
+* **scraper:** expose incomplete product pages as typed MCP tool errors
+* **scraper:** replace Playwright/Chromium with one shared curl_cffi Chrome-profile async HTTP session, preserving German locale, pacing, typed failures and bounded 429 backoff
+* **scraper:** bound the complete HTTP request and classify status, headers and body from the same response before parsing
+* **container:** remove browser downloads/system dependencies; retain nonroot operation and report local HTTP-session readiness
+* **config:** remove `AMZ_MAX_CONTEXTS`; tune `AMZ_MAX_CONCURRENT` directly and replace `AMZ_NAV_TIMEOUT_MS` with `AMZ_REQUEST_TIMEOUT_MS`
+
+Run the parser and real loopback HTTP-session regression with `python -m unittest discover -s tests`.
+
 ## [0.1.2](https://github.com/jnslmk/amazon-mcp/compare/v0.1.1...v0.1.2) (2026-09-20)
 
 
