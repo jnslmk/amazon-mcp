@@ -4,6 +4,7 @@
 
 ### Bug Fixes
 
+* **http:** replace curl_cffi with pinned wreq Chrome154 after a same-host NAS search/detail passed without a browser; preserve cookies, bounded redirects, canonical prices and strict challenge/429/backoff handling
 * **scraper:** parse German and English price separators without inflating cents
 * **scraper:** require a product title and read only product-specific price slots, never recommendation prices
 * **scraper:** expose incomplete product pages as typed MCP tool errors

@@ -107,6 +107,7 @@ class HttpSessionTests(unittest.IsolatedAsyncioTestCase):
             (429, challenge),
             (200, challenge),
             (200, '<h1 id="productTitle"> </h1>'),
+            (302, ""),
             (200, "Keine Ergebnisse"),
             (200, detail),
         ]
@@ -123,6 +124,8 @@ class HttpSessionTests(unittest.IsolatedAsyncioTestCase):
                 if status == 429:
                     self.send_header("Retry-After", "3600")
                     self.send_header("Set-Cookie", "session=retained; Path=/")
+                if status == 302:
+                    self.send_header("Location", "/s?k=none-final")
                 self.end_headers()
                 self.wfile.write(payload)
 
@@ -162,7 +165,8 @@ class HttpSessionTests(unittest.IsolatedAsyncioTestCase):
                     (product["asin"], product["price"], product["currency"], product["availability"]),
                     ("B0DLTX9HSS", 16.99, "EUR", "Auf Lager"),
                 )
-                self.assertEqual(len(requests), 5)
+                # Five lookups plus one redirect, never a retry of a denial.
+                self.assertEqual(len(requests), 6)
                 self.assertTrue(all("session=retained" in r.get("Cookie", "") for r in requests[1:]))
                 self.assertTrue(all(r.get("Accept-Language") == "de-DE,de;q=0.9,en;q=0.8" for r in requests))
         finally:

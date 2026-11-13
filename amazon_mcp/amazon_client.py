@@ -2,7 +2,7 @@
 
 Amazon has no keyless product-search API for this use case (PA-API needs
 Associate sales eligibility and is being deprecated), so this is a scraper.
-Pages are fetched with curl_cffi's Chrome HTTP/TLS profile, without a browser
+Pages are fetched with wreq's Chrome HTTP/TLS profile, without a browser
 or JavaScript engine. One shared async session retains cookies and connections;
 challenges remain explicit failures rather than triggering another backend.
 
@@ -19,11 +19,13 @@ import os
 import random
 import re
 import time
+from datetime import timedelta
 from typing import Any, Optional
 from urllib.parse import quote_plus, urlencode
 
 from bs4 import BeautifulSoup
-from curl_cffi.requests import AsyncSession
+from wreq import Client, Emulation
+from wreq.redirect import Policy
 
 log = logging.getLogger("amazon-mcp")
 
@@ -46,7 +48,7 @@ BACKOFF_MAX_S = float(os.getenv("AMZ_BACKOFF_MAX_S", "120.0"))
 # genuine "come back in 90s" is still honoured in full.
 RETRY_AFTER_MAX_S = float(os.getenv("AMZ_RETRY_AFTER_MAX_S", "180.0"))
 
-# curl_cffi supplies the Chrome identity; retain the operator's UA override.
+# wreq supplies the Chrome identity; retain the operator's UA override.
 # Amazon localises on Accept-Language, so German stays explicit.
 _USER_AGENT = os.getenv("AMZ_USER_AGENT") or None
 _EXTRA_HEADERS = {
@@ -100,7 +102,7 @@ class AmazonHttpClient:
         if max_concurrent < 1:
             raise ValueError("AMZ_MAX_CONCURRENT must be positive")
         self._max_concurrent = max_concurrent
-        self._session: Optional[AsyncSession] = None
+        self._session: Optional[Client] = None
         self._sem = asyncio.Semaphore(max_concurrent)
         self._pace_lock = asyncio.Lock()
         self._next_ok = 0.0
@@ -113,29 +115,19 @@ class AmazonHttpClient:
         headers = dict(_EXTRA_HEADERS)
         if _USER_AGENT:
             headers["User-Agent"] = _USER_AGENT
-        session = AsyncSession(
-            impersonate="chrome",
+        self._session = Client(
+            emulation=Emulation.Chrome154,
             headers=headers,
-            max_clients=self._max_concurrent,
-            timeout=REQUEST_TIMEOUT_MS / 1000,
+            cookie_store=True,
+            redirect=Policy.limited(30),
+            timeout=timedelta(milliseconds=REQUEST_TIMEOUT_MS),
         )
-        try:
-            # Initialise libcurl before advertising local transport readiness.
-            handle = await session.pop_curl()
-            session.push_curl(handle)
-        except BaseException:
-            try:
-                await session.close()
-            except Exception:
-                log.exception("HTTP session close failed after startup error")
-            raise
-        self._session = session
         log.info("HTTP client ready (max_concurrent=%s)", self._max_concurrent)
 
     async def close(self) -> None:
         session, self._session = self._session, None
         if session is not None:
-            await session.close()
+            session.close()
 
     @property
     def ready(self) -> bool:
@@ -202,18 +194,18 @@ class AmazonHttpClient:
             retry_after,
         )
 
-    async def _load(self, session: AsyncSession, url: str) -> str:
-        response = await session.get(url)
-        if response.status_code == 429:
-            # Status, headers and body always belong to this same response.
-            raise RateLimitError(
-                "amazon.de rate-limited the request (HTTP 429)",
-                _parse_retry_after(response.headers),
-            )
+    async def _load(self, session: Client, url: str) -> str:
+        async with session.get(url) as response:
+            if response.status.as_int() == 429:
+                # Status, headers and body always belong to this same response.
+                raise RateLimitError(
+                    "amazon.de rate-limited the request (HTTP 429)",
+                    _parse_retry_after(response.headers),
+                )
 
-        html = response.text
-        self._raise_if_blocked(html)
-        response.raise_for_status()
+            html = await response.text()
+            self._raise_if_blocked(html)
+            response.raise_for_status()
         is_search = "/s?" in url or "/s/" in url
         selector = (
             '[data-component-type="s-search-result"]' if is_search else "#productTitle"
