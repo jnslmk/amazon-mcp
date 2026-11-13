@@ -9,7 +9,7 @@ as a self-hosted container behind an MCP client such as LibreChat — the same
 shape as its siblings [ebay-mcp](https://github.com/jnslmk/ebay-mcp) and
 [kleinanzeigen-mcp](https://github.com/jnslmk/kleinanzeigen-mcp).
 
-## Why a scraper (and why curl_cffi)
+## Why a scraper (and why wreq)
 
 Amazon has **no keyless product-search API** for this use case — the Product
 Advertising API (PA-API) requires Amazon Associate sales eligibility and is
@@ -17,13 +17,14 @@ being wound down. So this is a scraper, and like Kleinanzeigen it is inherently
 **ToS-gray and fragile**: Amazon can change its markup or tighten bot detection
 at any time.
 
-The default transport is **browser-free**: `curl_cffi.requests.AsyncSession`
-uses a Chrome HTTP/TLS profile and an explicit German language header. A real
-search followed by a result-derived product detail succeeded with this profile
-where plain stdlib HTTP received `bm-verify`. One shared session retains cookies
-and connections; no JavaScript engine, browser download or fallback is used.
-This is not a guarantee of access: Amazon can still block an IP or change its
-markup, and such responses fail explicitly.
+The default transport is **browser-free**: `wreq.Client` uses a Chrome154
+HTTP/TLS profile and an explicit German language header. A same-host NAS
+search and result-derived detail passed with matching **10.99 EUR**, stock and
+seven images where `curl_cffi` received `bm-verify`. This uses the HTTP library
+underlying Obscura, not its browser/JavaScript engine. One shared session keeps
+cookies and connections; no browser download or fallback is used. Access is
+not guaranteed: Amazon can still block an IP or change its markup, and such
+responses fail explicitly.
 
 ## Tools
 
@@ -44,7 +45,7 @@ No credentials. Everything is optional tuning (see `.env.example`):
 | `MCP_TRANSPORT` | `http` | `http` (streamable-HTTP) or `stdio` |
 | `MCP_HOST` / `MCP_PORT` / `MCP_PATH` | `0.0.0.0` / `8000` / `/mcp` | HTTP bind |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `AMZ_MAX_CONCURRENT` | `2` | Max concurrent HTTP requests (and connection-pool handles) |
+| `AMZ_MAX_CONCURRENT` | `2` | Max concurrent complete HTTP requests, including body reads |
 | `AMZ_REQUEST_TIMEOUT_MS` | `45000` | Complete HTTP request wall budget, including redirects/body, after concurrency/pacing queues |
 | `AMZ_USER_AGENT` | Chrome profile default | Optional User-Agent override; German `Accept-Language` stays explicit |
 | `AMZ_PACING_MIN_S` / `AMZ_PACING_MAX_S` | `1.5` / `4.0` | Jittered delay between request starts |

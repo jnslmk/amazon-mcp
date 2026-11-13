@@ -2,7 +2,7 @@
 
 Amazon offers no keyless product-search API for this use case, so this is a
 scraper. The client library (:mod:`amazon_mcp.amazon_client`) owns a shared
-curl_cffi async HTTP session with a Chrome TLS profile; this module owns the
+wreq async HTTP session with a Chrome TLS profile; this module owns the
 two tools, response shaping and the streamable-HTTP transport. No browser or
 JavaScript engine is needed; bot challenges are surfaced as tool errors.
 
