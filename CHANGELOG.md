@@ -15,6 +15,13 @@
 
 Run the parser and real loopback HTTP-session regression with `python -m unittest discover -s tests`.
 
+## [0.2.1](https://github.com/jnslmk/amazon-mcp/compare/v0.2.0...v0.2.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **http:** use wreq for native nas requests ([#5](https://github.com/jnslmk/amazon-mcp/issues/5)) ([fd92ab4](https://github.com/jnslmk/amazon-mcp/commit/fd92ab48f0e9048b2b2b7f1c7004cb0ff1bbf277))
+
 ## [0.2.0](https://github.com/jnslmk/amazon-mcp/compare/v0.1.2...v0.2.0) (2026-11-12)
 
 
